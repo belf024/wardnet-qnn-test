@@ -1,4 +1,4 @@
-name: Build isolated QNN HTP test APK
+name: Build WARDNET QNN Device Probe
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
-      - name: Checkout upstream HTP test source
+      - name: Checkout Gradle base project
         uses: actions/checkout@v6
         with:
           repository: pytorch/executorch
@@ -21,7 +21,17 @@ jobs:
             examples/qualcomm/qnn-htp-test
           sparse-checkout-cone-mode: true
 
-      - name: Configure JDK 17
+      - name: Checkout Qualcomm QNN API headers
+        uses: actions/checkout@v6
+        with:
+          repository: qualcomm/geniex-qairt-plugin
+          ref: main
+          path: qnn_headers
+          sparse-checkout: |
+            qnn-api/include
+          sparse-checkout-cone-mode: true
+
+      - name: Configure Java 17
         uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -32,14 +42,7 @@ jobs:
         with:
           packages: 'platform-tools'
 
-      - name: Verify upstream project and Gradle wrapper
-        run: |
-          set -euo pipefail
-          test -f upstream/examples/qualcomm/qnn-htp-test/app/build.gradle
-          test -f upstream/examples/qualcomm/qnn-htp-test/gradle/wrapper/gradle-wrapper.jar
-          test -f upstream/examples/qualcomm/qnn-htp-test/app/src/main/AndroidManifest.xml
-
-      - name: Install required SDK, NDK and CMake components
+      - name: Install build dependencies
         run: |
           set -euo pipefail
           sdkmanager --install \
@@ -48,7 +51,7 @@ jobs:
             'ndk;29.0.13599879' \
             'cmake;3.22.1'
 
-      - name: Download Qualcomm QNN runtime 2.44.0
+      - name: Download QNN runtime 2.44.0 for ARM64
         working-directory: upstream/examples/qualcomm/qnn-htp-test
         run: |
           set -euo pipefail
@@ -57,31 +60,377 @@ jobs:
             --output /tmp/qnn-runtime-2.44.0.aar
           mkdir -p app/src/main/jniLibs/arm64-v8a
           unzip -j -o /tmp/qnn-runtime-2.44.0.aar \
-            'jni/arm64-v8a/*.so' \
-            -d app/src/main/jniLibs/arm64-v8a
+            'jni/arm64-v8a/*.so' -d app/src/main/jniLibs/arm64-v8a
           test -s app/src/main/jniLibs/arm64-v8a/libQnnHtp.so
           test -s app/src/main/jniLibs/arm64-v8a/libQnnHtpV75Stub.so
+          test -s app/src/main/jniLibs/arm64-v8a/libQnnHtpV75Skel.so
 
-      - name: Build standalone QNN HTP test APK
-        working-directory: upstream/examples/qualcomm/qnn-htp-test
+      - name: Install isolated device-creation probe sources
+        env:
+          QNN_HEADERS: ${{ github.workspace }}/qnn_headers/qnn-api/include
         run: |
-          chmod +x ./gradlew
-          ./gradlew --no-daemon assembleDebug
+          set -euo pipefail
+          project='upstream/examples/qualcomm/qnn-htp-test'
+          test -s "$project/gradle/wrapper/gradle-wrapper.jar"
+          test -s "$QNN_HEADERS/QnnInterface.h"
+          rm -rf "$project/app/src/main/java" "$project/app/src/main/cpp" "$project/app/src/main/AndroidManifest.xml"
+          mkdir -p "$project/app/src/main/java/org/wardnet/qnnprobe" "$project/app/src/main/cpp"
+          cat > "$project/settings.gradle" <<'WARDNET_PROBE_FILE_settings_gradle'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'WARDNET-QNN-DeviceProbe'
+          include ':app'
+          WARDNET_PROBE_FILE_settings_gradle
+          cat > "$project/build.gradle" <<'WARDNET_PROBE_FILE_build_gradle'
+          plugins {
+              id 'com.android.application' version '8.6.1' apply false
+          }
+          WARDNET_PROBE_FILE_build_gradle
+          cat > "$project/app/build.gradle" <<'WARDNET_PROBE_FILE_app_build_gradle'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'org.wardnet.qnnprobe'
+              compileSdk 34
+              ndkVersion '29.0.13599879'
+              defaultConfig {
+                  applicationId 'org.wardnet.qnnprobe'
+                  minSdk 32
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0-device-create'
+                  ndk { abiFilters 'arm64-v8a' }
+                  externalNativeBuild {
+                      cmake {
+                          arguments "-DQNN_HEADERS=${System.getenv('QNN_HEADERS')}"
+                          cppFlags '-std=c++17'
+                      }
+                  }
+              }
+              buildTypes {
+                  release { minifyEnabled false }
+              }
+              externalNativeBuild {
+                  cmake {
+                      path 'src/main/cpp/CMakeLists.txt'
+                      version '3.22.1'
+                  }
+              }
+              packagingOptions {
+                  jniLibs { useLegacyPackaging = true }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          WARDNET_PROBE_FILE_app_build_gradle
+          cat > "$project/app/src/main/AndroidManifest.xml" <<'WARDNET_PROBE_FILE_AndroidManifest_xml'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="QNN Device Probe"
+                           android:usesCleartextTraffic="false"
+                           android:extractNativeLibs="true">
+                  <uses-native-library android:name="libcdsprpc.so" android:required="true" />
+                  <activity android:name=".MainActivity"
+                            android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          WARDNET_PROBE_FILE_AndroidManifest_xml
+          cat > "$project/app/src/main/java/org/wardnet/qnnprobe/MainActivity.java" <<'WARDNET_PROBE_FILE_MainActivity_java'
+          package org.wardnet.qnnprobe;
+          
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.graphics.Typeface;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.graphics.Color;
+          
+          public class MainActivity extends Activity {
+              private TextView output;
+              private Button run;
+          
+              static {
+                  System.loadLibrary("wardnet_qnn_probe");
+              }
+          
+              private static native String runProbe(String nativeLibraryDir);
+          
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(24, 48, 24, 24);
+                  root.setBackgroundColor(Color.rgb(11, 14, 14));
+                  TextView title = new TextView(this);
+                  title.setText("WARDNET  /  QNN DEVICE PROBE");
+                  title.setTextSize(20);
+                  title.setTextColor(Color.rgb(223, 218, 204));
+                  root.addView(title);
+          
+                  run = new Button(this);
+                  run.setText("RUN DEVICE INITIALIZATION");
+                  root.addView(run);
+          
+                  ScrollView scroll = new ScrollView(this);
+                  output = new TextView(this);
+                  output.setTextColor(Color.rgb(225, 225, 218));
+                  output.setTextSize(13);
+                  output.setTypeface(Typeface.MONOSPACE);
+                  output.setText("This test calls QnnBackend_create, then QnnDevice_create.\n" +
+                        "It does not change system settings or install a model.\n\n" +
+                        "Tap the button to run.\n");
+                  output.setTextIsSelectable(true);
+                  scroll.addView(output);
+                  root.addView(scroll, new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+                  setContentView(root);
+          
+                  run.setOnClickListener(v -> {
+                      run.setEnabled(false);
+                      output.setText("Running QNN initialization...\n");
+                      new Thread(() -> {
+                          String result;
+                          try {
+                              result = runProbe(getApplicationInfo().nativeLibraryDir);
+                          } catch (Throwable t) {
+                              result = "JNI FAILURE: " + t.toString();
+                          }
+                          final String text = result;
+                          runOnUiThread(() -> {
+                              output.setText(text);
+                              run.setEnabled(true);
+                          });
+                      }, "qnn-device-probe").start();
+                  });
+              }
+          }
+          WARDNET_PROBE_FILE_MainActivity_java
+          cat > "$project/app/src/main/cpp/CMakeLists.txt" <<'WARDNET_PROBE_FILE_CMakeLists_txt'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(wardnet_qnn_probe LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          if(NOT EXISTS "${QNN_HEADERS}/QnnInterface.h")
+              message(FATAL_ERROR "QNN headers unavailable: ${QNN_HEADERS}")
+          endif()
+          add_library(wardnet_qnn_probe SHARED qnn_probe.cpp)
+          target_include_directories(wardnet_qnn_probe PRIVATE "${QNN_HEADERS}")
+          target_link_libraries(wardnet_qnn_probe log dl)
+          WARDNET_PROBE_FILE_CMakeLists_txt
+          cat > "$project/app/src/main/cpp/qnn_probe.cpp" <<'WARDNET_PROBE_FILE_qnn_probe_cpp'
+          #include <jni.h>
+          #include <android/log.h>
+          #include <dlfcn.h>
+          #include <cstdlib>
+          #include <cstdarg>
+          #include <cstdio>
+          #include <cstdint>
+          #include <sstream>
+          #include <iomanip>
+          #include <string>
+          #include <mutex>
+          #include <QnnInterface.h>
+          
+          namespace {
+          std::mutex gLogMutex;
+          std::string gQnnLogs;
+          
+          void qnnLogCallback(const char* format, QnnLog_Level_t /*level*/,
+                              uint64_t /*timestamp*/, va_list args) {
+              if (!format) return;
+              char buffer[1024];
+              vsnprintf(buffer, sizeof(buffer), format, args);
+              __android_log_write(ANDROID_LOG_INFO, "WARDNET_QNN", buffer);
+              std::lock_guard<std::mutex> lock(gLogMutex);
+              if (gQnnLogs.size() < 12000) {
+                  gQnnLogs.append(buffer);
+                  gQnnLogs.push_back('\n');
+              }
+          }
+          
+          std::string errorCode(Qnn_ErrorHandle_t err) {
+              std::ostringstream out;
+              out << static_cast<unsigned long long>(err) << " (0x" << std::hex
+                  << static_cast<unsigned long long>(err) << std::dec << ")";
+              return out.str();
+          }
+          
+          std::string doProbe(const std::string& libDir) {
+              std::ostringstream out;
+              out << "WARDNET / QNN DEVICE INITIALIZATION TEST\n";
+              out << "QNN header API: " << QNN_API_VERSION_MAJOR << "."
+                  << QNN_API_VERSION_MINOR << "\n";
+              out << "nativeLibraryDir: " << libDir << "\n";
+              out << "Hardware target: SM8650 / Hexagon V75\n\n";
+          
+              // QNN's FastRPC loader needs the bundled HTP skel/stub search path.
+              setenv("ADSP_LIBRARY_PATH", libDir.c_str(), 1);
+              setenv("DSP_LIBRARY_PATH", libDir.c_str(), 1);
+          
+              const std::string path = libDir + "/libQnnHtp.so";
+              void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+              if (!handle) {
+                  out << "FAIL: dlopen libQnnHtp.so: " << dlerror() << "\n";
+                  return out.str();
+              }
+              out << "[1] libQnnHtp.so loaded\n";
+          
+              using ProvidersFn = Qnn_ErrorHandle_t (*)(const QnnInterface_t***, uint32_t*);
+              auto getProviders = reinterpret_cast<ProvidersFn>(dlsym(handle, "QnnInterface_getProviders"));
+              if (!getProviders) {
+                  out << "FAIL: QnnInterface_getProviders symbol missing\n";
+                  dlclose(handle);
+                  return out.str();
+              }
+              const QnnInterface_t** providers = nullptr;
+              uint32_t providerCount = 0;
+              Qnn_ErrorHandle_t status = getProviders(&providers, &providerCount);
+              out << "[2] getProviders: " << errorCode(status)
+                  << "; providers=" << providerCount << "\n";
+              if (status != QNN_SUCCESS || !providers || providerCount == 0) {
+                  out << "FAIL: Provider discovery\n";
+                  dlclose(handle);
+                  return out.str();
+              }
+          
+              const QnnInterface_t* selected = nullptr;
+              for (uint32_t i = 0; i < providerCount; ++i) {
+                  const QnnInterface_t* p = providers[i];
+                  if (!p) continue;
+                  out << "    provider[" << i << "]: core="
+                      << p->apiVersion.coreApiVersion.major << "."
+                      << p->apiVersion.coreApiVersion.minor << ", backend="
+                      << p->apiVersion.backendApiVersion.major << "."
+                      << p->apiVersion.backendApiVersion.minor << "\n";
+                  if (p->apiVersion.coreApiVersion.major == QNN_API_VERSION_MAJOR &&
+                      p->apiVersion.coreApiVersion.minor >= QNN_API_VERSION_MINOR) {
+                      selected = p;
+                      break;
+                  }
+              }
+              if (!selected) {
+                  out << "FAIL: No compatible provider for compiled QNN headers\n";
+                  dlclose(handle);
+                  return out.str();
+              }
+              const auto& api = selected->QNN_INTERFACE_VER_NAME;
+              if (!api.backendCreate || !api.deviceCreate) {
+                  out << "FAIL: backendCreate/deviceCreate missing from provider\n";
+                  dlclose(handle);
+                  return out.str();
+              }
+          
+              Qnn_LogHandle_t logger = nullptr;
+              if (api.logCreate) {
+                  status = api.logCreate(qnnLogCallback, QNN_LOG_LEVEL_INFO, &logger);
+                  out << "[3] logCreate: " << errorCode(status) << "\n";
+                  if (status != QNN_SUCCESS) logger = nullptr;
+              }
+          
+              Qnn_BackendHandle_t backend = nullptr;
+              status = api.backendCreate(logger, nullptr, &backend);
+              out << "[4] backendCreate: " << errorCode(status) << "\n";
+              if (status != QNN_SUCCESS || !backend) {
+                  out << "FAIL: backendCreate\n";
+              } else {
+                  Qnn_DeviceHandle_t device = nullptr;
+                  status = api.deviceCreate(logger, nullptr, &device);
+                  out << "[5] deviceCreate: " << errorCode(status) << "\n";
+                  if (status == QNN_SUCCESS && device) {
+                      out << "PASS: QNN DEVICE CREATED\n";
+                      out << "This confirms device initialization, NOT graph inference.\n";
+                  } else {
+                      out << "FAIL: DEVICE INITIALIZATION (the step Local Dream fails)\n";
+                  }
+                  if (device && api.deviceFree) {
+                      Qnn_ErrorHandle_t freeStatus = api.deviceFree(device);
+                      out << "[6] deviceFree: " << errorCode(freeStatus) << "\n";
+                  }
+                  if (api.backendFree) {
+                      Qnn_ErrorHandle_t freeStatus = api.backendFree(backend);
+                      out << "[7] backendFree: " << errorCode(freeStatus) << "\n";
+                  }
+              }
+              if (logger && api.logFree) api.logFree(logger);
+              dlclose(handle);
+              {
+                  std::lock_guard<std::mutex> lock(gLogMutex);
+                  if (!gQnnLogs.empty()) out << "\nQNN runtime messages:\n" << gQnnLogs;
+              }
+              return out.str();
+          }
+          }  // namespace
+          
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_org_wardnet_qnnprobe_MainActivity_runProbe(JNIEnv* env, jclass,
+                                                           jstring libraryDir) {
+              const char* ptr = env->GetStringUTFChars(libraryDir, nullptr);
+              std::string path = ptr ? ptr : "";
+              if (ptr) env->ReleaseStringUTFChars(libraryDir, ptr);
+              {
+                  std::lock_guard<std::mutex> lock(gLogMutex);
+                  gQnnLogs.clear();
+              }
+              const auto result = doProbe(path);
+              return env->NewStringUTF(result.c_str());
+          }
+          WARDNET_PROBE_FILE_qnn_probe_cpp
+          cat > "$project/gradle/wrapper/gradle-wrapper.properties" <<'WARDNET_WRAPPER'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.10.2-bin.zip
+          networkTimeout=10000
+          validateDistributionUrl=true
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          WARDNET_WRAPPER
 
-      - name: Verify and hash resulting APK
+      - name: Build QNN Device Probe APK
+        working-directory: upstream/examples/qualcomm/qnn-htp-test
+        env:
+          QNN_HEADERS: ${{ github.workspace }}/qnn_headers/qnn-api/include
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Verify result and produce checksum
         run: |
           set -euo pipefail
           apk='upstream/examples/qualcomm/qnn-htp-test/app/build/outputs/apk/debug/app-debug.apk'
           test -s "$apk"
-          sha256sum "$apk" | tee QNN-HTP-Test-SHA256.txt
-          ls -lh "$apk"
+          sha256sum "$apk" > WARDNET-QNN-DeviceProbe-SHA256.txt
+          unzip -l "$apk" | grep -E 'libwardnet_qnn_probe\.so|libQnnHtpV75Stub\.so|libQnnHtp\.so'
 
-      - name: Upload APK and checksum
+      - name: Upload QNN Device Probe APK
         uses: actions/upload-artifact@v4
         with:
-          name: WARDNET-QNN-HTP-Test-APK
+          name: WARDNET-QNN-DeviceProbe-APK
           path: |
             upstream/examples/qualcomm/qnn-htp-test/app/build/outputs/apk/debug/app-debug.apk
-            QNN-HTP-Test-SHA256.txt
+            WARDNET-QNN-DeviceProbe-SHA256.txt
           if-no-files-found: error
           retention-days: 7
