@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 35
     steps:
       - name: Checkout upstream HTP test source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: pytorch/executorch
           ref: main
@@ -22,16 +22,26 @@ jobs:
           sparse-checkout-cone-mode: true
 
       - name: Configure JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Configure Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Verify upstream project and Gradle wrapper
+        run: |
+          set -euo pipefail
+          test -f upstream/examples/qualcomm/qnn-htp-test/app/build.gradle
+          test -f upstream/examples/qualcomm/qnn-htp-test/gradle/wrapper/gradle-wrapper.jar
+          test -f upstream/examples/qualcomm/qnn-htp-test/app/src/main/AndroidManifest.xml
 
       - name: Install required SDK, NDK and CMake components
         run: |
+          set -euo pipefail
           sdkmanager --install \
             'platforms;android-34' \
             'build-tools;34.0.0' \
